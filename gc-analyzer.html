@@ -43,7 +43,7 @@ pre#outputPre{background:#1e1e2e;padding:14px 16px;font-size:12px;line-height:1.
 </style>
 </head>
 <body>
-<h1>FullGC 解析ツール <span>v2.0 &nbsp;|&nbsp; jstat-gc / jstack / jmap / Tomcat アクセスログ対応</span></h1>
+<h1>FullGC 解析ツール <span>v2.1 &nbsp;|&nbsp; jstat-gc / jstack / Tomcat アクセスログ対応</span></h1>
 <div class="container">
   <div class="servers-grid" id="serversGrid"></div>
   <div class="actions">
@@ -94,18 +94,6 @@ let activeTab = '';
           <button class="file-btn" id="btn_${id}_jstack" onclick="triggerFile('${id}','jstack')">選択</button>
           <input  type="file" id="file_${id}_jstack" accept=".log,.txt"      onchange="loadFile('${id}','jstack',this)">
           <span   class="file-status" id="stat_${id}_jstack">未選択</span>
-        </div>
-        <div class="file-row">
-          <label>jmap-heap</label>
-          <button class="file-btn" id="btn_${id}_jmapheap" onclick="triggerFile('${id}','jmapheap')">選択</button>
-          <input  type="file" id="file_${id}_jmapheap" accept=".log,.txt"    onchange="loadFile('${id}','jmapheap',this)">
-          <span   class="file-status" id="stat_${id}_jmapheap">未選択</span>
-        </div>
-        <div class="file-row">
-          <label>jmap-histo</label>
-          <button class="file-btn" id="btn_${id}_jmaphisto" onclick="triggerFile('${id}','jmaphisto')">選択</button>
-          <input  type="file" id="file_${id}_jmaphisto" accept=".log,.txt"   onchange="loadFile('${id}','jmaphisto',this)">
-          <span   class="file-status" id="stat_${id}_jmaphisto">未選択</span>
         </div>
         <div class="file-row">
           <label>access.log</label>
@@ -283,118 +271,6 @@ function parseAccessLog(text) {
     });
   }
   return entries;
-}
-
-// =====================================================================
-//  PARSER: jmap -heap  (ヒープ構成・使用状況)
-// =====================================================================
-function parseJmapHeap(text) {
-  if (!text || !text.trim()) return null;
-  const config = {};
-  const usage  = {};
-
-  // Heap Configuration セクション
-  const cfgPatterns = {
-    maxHeapMB    : /MaxHeapSize\s*=\s*\d+\s*\(([0-9.]+)\s*MB\)/,
-    newSizeMB    : /NewSize\s*=\s*\d+\s*\(([0-9.]+)\s*MB\)/,
-    maxNewSizeMB : /MaxNewSize\s*=\s*\d+\s*\(([0-9.]+)\s*MB\)/,
-    oldSizeMB    : /OldSize\s*=\s*\d+\s*\(([0-9.]+)\s*MB\)/,
-    newRatio     : /NewRatio\s*=\s*(\d+)/,
-    survivorRatio: /SurvivorRatio\s*=\s*(\d+)/,
-    metaspaceMB  : /MetaspaceSize\s*=\s*\d+\s*\(([0-9.]+)\s*MB\)/,
-    maxMetaMB    : /MaxMetaspaceSize\s*=\s*\d+\s*\(([0-9.]+)\s*MB\)/,
-  };
-  for (const [k, pat] of Object.entries(cfgPatterns)) {
-    const m = text.match(pat);
-    if (m) config[k] = parseFloat(m[1]);
-  }
-
-  // Heap Usage セクション (GC 種別によりラベルが異なる)
-  const REGIONS = [
-    'Eden Space', 'From Space', 'To Space',
-    'PS Young Generation', 'PS Old Generation',
-    'def new generation', 'tenured generation',
-    'Old Generation', 'Metaspace'
-  ];
-  const lines = text.split(/\r?\n/);
-  let curReg = null, rd = {};
-  for (const line of lines) {
-    for (const reg of REGIONS) {
-      if (line.includes(reg)) {
-        if (curReg && rd.pct !== undefined) usage[curReg] = rd;
-        curReg = reg; rd = { name: reg };
-        break;
-      }
-    }
-    if (!curReg) continue;
-    const cap  = line.match(/capacity\s*=\s*\d+\s*\(([0-9.]+)\s*[KMG]B\)/i);
-    const used = line.match(/used\s*=\s*\d+\s*\(([0-9.]+)\s*[KMG]B\)/i);
-    const pct  = line.match(/([0-9.]+)%\s*used/);
-    if (cap)  rd.capacityMB = parseFloat(cap[1]);
-    if (used) rd.usedMB     = parseFloat(used[1]);
-    if (pct)  rd.pct        = parseFloat(pct[1]);
-  }
-  if (curReg && rd.pct !== undefined) usage[curReg] = rd;
-
-  return { config, usage };
-}
-
-// =====================================================================
-//  PARSER: jmap -histo  (オブジェクトヒストグラム)
-// =====================================================================
-function parseJmapHisto(text) {
-  if (!text || !text.trim()) return [];
-  // 書式:  num   #instances   #bytes  class name
-  //          1:      12345   123456789  [B
-  const entries = [];
-  for (const line of text.split(/\r?\n/)) {
-    const m = line.match(/^\s*(\d+):\s+(\d+)\s+(\d+)\s+(\S+)/);
-    if (!m) continue;
-    entries.push({
-      rank     : parseInt(m[1]),
-      instances: parseInt(m[2]),
-      bytes    : parseInt(m[3]),
-      className: m[4]
-    });
-  }
-  return entries;
-}
-
-// =====================================================================
-//  ANALYZER: jmap
-// =====================================================================
-function analyzeJmapHeap(heapData) {
-  if (!heapData) return null;
-  const { config, usage } = heapData;
-  const warnings = [];
-
-  const oldReg  = usage['PS Old Generation'] || usage['Old Generation'] || usage['tenured generation'];
-  const edenReg = usage['Eden Space'];
-  const metaReg = usage['Metaspace'];
-
-  if (oldReg  && oldReg.pct  > 80) warnings.push('OldGen ' + oldReg.pct.toFixed(1) + '% 使用中 → FullGC リスク高');
-  if (edenReg && edenReg.pct > 90) warnings.push('Eden Space ' + edenReg.pct.toFixed(1) + '% 使用中 → Young GC 頻発の可能性');
-  if (metaReg && metaReg.pct > 85) warnings.push('Metaspace ' + metaReg.pct.toFixed(1) + '% 使用中 → クラスロード過多の可能性');
-
-  return { config, usage, oldReg, edenReg, metaReg, warnings };
-}
-
-function analyzeJmapHisto(entries) {
-  if (!entries || entries.length === 0) return null;
-  const top10      = entries.slice(0, 10);
-  const totalBytes = entries.reduce((s, e) => s + e.bytes, 0);
-
-  // アプリ固有クラス (java/sun/[B 等の JDK 標準を除く)
-  const appClasses = entries.filter(e =>
-    !e.className.startsWith('java.')  &&
-    !e.className.startsWith('javax.') &&
-    !e.className.startsWith('sun.')   &&
-    !e.className.startsWith('com.sun.') &&
-    !e.className.startsWith('[')      &&
-    e.bytes > totalBytes * 0.005
-  ).slice(0, 5);
-
-  return { top10, totalBytes, appClasses };
 }
 
 // =====================================================================
@@ -644,7 +520,7 @@ function p2(n) { return String(n).padStart(2,'0'); }
 const SEP  = '='.repeat(80);
 const SEP2 = '-'.repeat(80);
 
-function buildServerReport(serverId, jstat, jstack, jmapHeap, jmapHisto, access) {
+function buildServerReport(serverId, jstat, jstack, access) {
   const L = [];
   const add = (s) => L.push(s === undefined ? '' : s);
 
@@ -841,77 +717,8 @@ function buildServerReport(serverId, jstat, jstack, jmapHeap, jmapHisto, access)
     add('  N/A (jstack.log 未読込)'); add();
   }
 
-  /* -------- [5] ヒープダンプ解析 -------- */
-  add('[5] ヒープダンプ解析');
-  add(SEP2);
-  if (jmapHeap) {
-    const c = jmapHeap.config;
-    add('  ヒープ構成 (jmap -heap):');
-    if (c.maxHeapMB)     add('    MaxHeapSize  : ' + c.maxHeapMB.toFixed(1) + ' MB');
-    if (c.maxNewSizeMB)  add('    Young Gen    : ' + c.maxNewSizeMB.toFixed(1) + ' MB  (NewSize)');
-    if (c.oldSizeMB)     add('    Old Gen      : ' + c.oldSizeMB.toFixed(1) + ' MB  (OldSize)');
-    if (c.newRatio)      add('    NewRatio     : ' + c.newRatio);
-    if (c.survivorRatio) add('    SurvivorRatio: ' + c.survivorRatio);
-    if (c.metaspaceMB)   add('    Metaspace    : ' + c.metaspaceMB.toFixed(1) + ' MB  (初期)');
-    add();
-    const REGION_ORDER = [
-      'Eden Space', 'From Space', 'To Space',
-      'PS Young Generation', 'PS Old Generation',
-      'def new generation', 'tenured generation',
-      'Old Generation', 'Metaspace'
-    ];
-    add('  ヒープ使用状況:');
-    for (const rk of REGION_ORDER) {
-      const r = jmapHeap.usage[rk];
-      if (!r || r.pct === undefined) continue;
-      const bar  = '█'.repeat(Math.round(r.pct / 5)).padEnd(20, '░');
-      const warn = r.pct > 80 ? '  ← 警告' : '';
-      add('  ' + r.name.padEnd(20) + '[' + bar + '] ' + r.pct.toFixed(1) + '%' + warn);
-    }
-    if (jmapHeap.warnings.length > 0) {
-      add();
-      for (const w of jmapHeap.warnings) add('  ⚠ ' + w);
-    }
-    add();
-  } else {
-    add('  N/A (jmap -heap の出力ログ未読込)');
-    add();
-  }
-
-  if (jmapHisto) {
-    add('  オブジェクトヒストグラム Top10 (jmap -histo):');
-    add('  ' + '-'.repeat(72));
-    add('  順位 | インスタンス数 | サイズ(MB) | クラス名');
-    add('  ' + '-'.repeat(72));
-    const totalMB = jmapHisto.totalBytes / 1024 / 1024;
-    jmapHisto.top10.forEach((e, i) => {
-      const mb  = (e.bytes / 1024 / 1024).toFixed(2);
-      const pct = ((e.bytes / jmapHisto.totalBytes) * 100).toFixed(1);
-      add('  ' + String(i+1).padStart(4)
-        + ' | ' + e.instances.toLocaleString().padStart(13)
-        + ' | ' + mb.padStart(9) + ' MB'
-        + ' (' + pct.padStart(4) + '%)'
-        + ' | ' + e.className);
-    });
-    add();
-    add('  合計ヒープ使用量 : ' + totalMB.toFixed(1) + ' MB');
-    add();
-    if (jmapHisto.appClasses.length > 0) {
-      add('  アプリ固有クラス (要確認):');
-      for (const e of jmapHisto.appClasses) {
-        const mb  = (e.bytes / 1024 / 1024).toFixed(2);
-        const pct = ((e.bytes / jmapHisto.totalBytes) * 100).toFixed(1);
-        add('  ★ ' + e.className + '  →  ' + mb + ' MB (' + pct + '%) / ' + e.instances.toLocaleString() + ' instances');
-      }
-      add();
-    }
-  } else {
-    add('  N/A (jmap -histo の出力ログ未読込)');
-    add();
-  }
-
-  /* -------- [6] アクセスログ -------- */
-  add('[6] アクセスログ解析');
+  /* -------- [5] アクセスログ -------- */
+  add('[5] アクセスログ解析');
   add(SEP2);
   if (access) {
     const slowPct = ((access.slowCount / access.totalRequests) * 100).toFixed(2);
@@ -951,22 +758,13 @@ function buildServerReport(serverId, jstat, jstack, jmapHeap, jmapHisto, access)
     add('  N/A (access.log 未読込)'); add();
   }
 
-  /* -------- [7] 推奨事項 -------- */
-  add('[7] 推奨事項 / 注意点');
+  /* -------- [6] 推奨事項 -------- */
+  add('[6] 推奨事項 / 注意点');
   add(SEP2);
   const recs = [];
-  if (!jstat)     recs.push('- jstat_gc.log を読み込むと GC 詳細が分析できます');
-  if (!jstack)    recs.push('- jstack.log を読み込むとスレッド状態が分析できます');
-  if (!jmapHeap)  recs.push('- jmap -heap の出力を読み込むとヒープ構成が分析できます');
-  if (!jmapHisto) recs.push('- jmap -histo の出力を読み込むとオブジェクト分布が分析できます');
-  if (!access)    recs.push('- access.log を読み込むと URI 別影響が分析できます');
-  if (jmapHeap && jmapHeap.warnings.length > 0)
-    for (const w of jmapHeap.warnings) recs.push('- [HIGH] ' + w);
-  if (jmapHisto && jmapHisto.appClasses.length > 0) {
-    recs.push('- [HIGH] 大量保持のアプリクラスを確認:');
-    for (const e of jmapHisto.appClasses)
-      recs.push('    ' + e.className + '  (' + (e.bytes/1024/1024).toFixed(1) + ' MB)');
-  }
+  if (!jstat)  recs.push('- jstat_gc.log を読み込むと GC 詳細が分析できます');
+  if (!jstack) recs.push('- jstack.log を読み込むとスレッド状態が分析できます');
+  if (!access) recs.push('- access.log を読み込むと URI 別影響が分析できます');
   if (jstat && !jstat.hasTimestamp)
     recs.push('- [INFO] jstat に -t を付けて再取得すると時系列相関が可能:  jstat -gc -t <pid> <interval>ms');
   if (jstat && jstat.maxOldGenPct > 85)
@@ -1020,12 +818,8 @@ function buildComparisonReport(allResults) {
     ['OldGen 平均(%)',     id => allResults[id].jstat  ? allResults[id].jstat.avgOldGenPct.toFixed(1)                 : 'N/A'],
     ['GC オーバーヘッド(%)' ,id=>allResults[id].jstat && allResults[id].jstat.gcOverhead !== null
                                                         ? allResults[id].jstat.gcOverhead.toFixed(1)                  : 'N/A'],
-    ['BLOCKED 最大数',      id => allResults[id].jstack    ? String(allResults[id].jstack.maxBlocked)                  : 'N/A'],
-    ['OldGen使用%(jmap)',   id => allResults[id].jmapHeap && allResults[id].jmapHeap.oldReg
-                                   ? allResults[id].jmapHeap.oldReg.pct.toFixed(1)                                    : 'N/A'],
-    ['ヒープ使用MB(histo)', id => allResults[id].jmapHisto
-                                   ? (allResults[id].jmapHisto.totalBytes/1024/1024).toFixed(0)                       : 'N/A'],
-    ['総リクエスト数',       id => allResults[id].access  ? allResults[id].access.totalRequests.toLocaleString()      : 'N/A'],
+    ['BLOCKED 最大数',      id => allResults[id].jstack ? String(allResults[id].jstack.maxBlocked)             : 'N/A'],
+    ['総リクエスト数',      id => allResults[id].access  ? allResults[id].access.totalRequests.toLocaleString() : 'N/A'],
     ['遅延リクエスト(>3s)',  id => allResults[id].access  ? allResults[id].access.slowCount.toLocaleString()          : 'N/A'],
   ];
 
@@ -1120,22 +914,18 @@ function analyzeAll() {
   for (let i = 1; i <= NUM_SERVERS; i++) {
     const svId     = 'sv' + i;
     const serverId = (document.getElementById('name_' + svId).value || ('server0' + i)).trim();
-    const jstatTxt     = fileData[svId + '_jstat'];
-    const jstackTxt    = fileData[svId + '_jstack'];
-    const jmapHeapTxt  = fileData[svId + '_jmapheap'];
-    const jmapHistoTxt = fileData[svId + '_jmaphisto'];
-    const accessTxt    = fileData[svId + '_access'];
-    if (!jstatTxt && !jstackTxt && !jmapHeapTxt && !jmapHistoTxt && !accessTxt) continue;
+    const jstatTxt  = fileData[svId + '_jstat'];
+    const jstackTxt = fileData[svId + '_jstack'];
+    const accessTxt = fileData[svId + '_access'];
+    if (!jstatTxt && !jstackTxt && !accessTxt) continue;
     anyData = true;
 
     try {
-      const jstatR      = jstatTxt     ? analyzeJstat(parseJstatGc(jstatTxt))              : null;
-      const jstackR     = jstackTxt    ? analyzeJstack(parseJstack(jstackTxt))             : null;
-      const jmapHeapR   = jmapHeapTxt  ? analyzeJmapHeap(parseJmapHeap(jmapHeapTxt))      : null;
-      const jmapHistoR  = jmapHistoTxt ? analyzeJmapHisto(parseJmapHisto(jmapHistoTxt))   : null;
-      const accessR     = accessTxt    ? analyzeAccessLog(parseAccessLog(accessTxt))       : null;
-      allResults[serverId] = { jstat: jstatR, jstack: jstackR, jmapHeap: jmapHeapR, jmapHisto: jmapHistoR, access: accessR };
-      reportTexts[serverId] = buildServerReport(serverId, jstatR, jstackR, jmapHeapR, jmapHistoR, accessR);
+      const jstatR  = jstatTxt  ? analyzeJstat(parseJstatGc(jstatTxt))          : null;
+      const jstackR = jstackTxt ? analyzeJstack(parseJstack(jstackTxt))         : null;
+      const accessR = accessTxt ? analyzeAccessLog(parseAccessLog(accessTxt))   : null;
+      allResults[serverId] = { jstat: jstatR, jstack: jstackR, access: accessR };
+      reportTexts[serverId] = buildServerReport(serverId, jstatR, jstackR, accessR);
     } catch(e) {
       reportTexts[serverId + '(エラー)'] = '解析中にエラーが発生しました: ' + e.message;
       allResults[serverId] = { jstat: null, jstack: null, access: null };
