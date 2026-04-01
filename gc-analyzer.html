@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>FullGC 解析ツール</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Meiryo','MS Gothic',monospace;background:#1e1e2e;color:#cdd6f4;min-height:100vh}
+h1{background:#313244;padding:14px 24px;font-size:18px;border-bottom:2px solid #89b4fa;display:flex;align-items:center;gap:12px}
+h1 span{color:#89b4fa;font-size:13px;font-weight:normal}
+.container{padding:16px 20px;max-width:1280px;margin:0 auto}
+.servers-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px}
+.server-card{background:#313244;border-radius:8px;padding:12px;border:1px solid #45475a;transition:border-color .2s}
+.server-card.has-data{border-color:#89b4fa}
+.server-name{font-size:12px;color:#89b4fa;margin-bottom:10px;font-weight:bold;display:flex;align-items:center;gap:6px}
+.server-name input{background:transparent;border:none;border-bottom:1px dashed #45475a;color:#89b4fa;font-size:12px;width:90px;outline:none;font-family:inherit;font-weight:bold}
+.file-row{margin:5px 0;display:flex;align-items:center;gap:6px}
+.file-row label{font-size:11px;color:#a6adc8;width:68px;flex-shrink:0}
+.file-row input[type=file]{display:none}
+.file-btn{font-size:11px;background:#45475a;border:1px solid #585b70;color:#cdd6f4;padding:3px 10px;border-radius:4px;cursor:pointer;white-space:nowrap;transition:all .15s}
+.file-btn:hover{background:#585b70}
+.file-btn.loaded{background:#1e3a1a;border-color:#a6e3a1;color:#a6e3a1}
+.file-status{font-size:10px;color:#6c7086;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100px}
+.file-status.ok{color:#a6e3a1}
+.actions{display:flex;gap:10px;margin-bottom:14px;align-items:center;flex-wrap:wrap}
+.btn-primary{background:#89b4fa;color:#1e1e2e;border:none;padding:9px 26px;border-radius:6px;font-size:13px;font-weight:bold;cursor:pointer;font-family:inherit;transition:background .15s}
+.btn-primary:hover{background:#b4d0ff}
+.btn-secondary{background:#45475a;color:#cdd6f4;border:1px solid #585b70;padding:7px 18px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;transition:background .15s}
+.btn-secondary:hover{background:#585b70}
+.status-bar{font-size:12px;color:#a6adc8}
+.status-bar.error{color:#f38ba8}
+.status-bar.ok{color:#a6e3a1}
+.output-section{background:#313244;border-radius:8px;border:1px solid #45475a}
+.output-tabs{display:flex;border-bottom:1px solid #45475a;overflow-x:auto;flex-shrink:0}
+.output-tab{padding:9px 16px;font-size:12px;cursor:pointer;border-bottom:3px solid transparent;white-space:nowrap;color:#a6adc8;transition:color .15s}
+.output-tab:hover{color:#cdd6f4}
+.output-tab.active{color:#89b4fa;border-bottom-color:#89b4fa}
+.copy-bar{display:flex;align-items:center;gap:10px;padding:6px 12px;border-bottom:1px solid #45475a;background:#1e1e2e}
+.copy-bar button{font-size:11px;background:#45475a;border:1px solid #585b70;color:#cdd6f4;padding:3px 12px;border-radius:4px;cursor:pointer;font-family:inherit}
+.copy-bar button:hover{background:#585b70}
+.copy-bar span{font-size:11px;color:#6c7086}
+pre#outputPre{background:#1e1e2e;padding:14px 16px;font-size:12px;line-height:1.65;white-space:pre;overflow:auto;max-height:580px;border-radius:0 0 8px 8px;font-family:'Consolas','Courier New',monospace;tab-size:2}
+</style>
+</head>
+<body>
+<h1>FullGC 解析ツール <span>v1.0 &nbsp;|&nbsp; jstat-gc / jstack / Tomcat アクセスログ対応</span></h1>
+<div class="container">
+  <div class="servers-grid" id="serversGrid"></div>
+  <div class="actions">
+    <button class="btn-primary" onclick="analyzeAll()">▶ 解析実行</button>
+    <button class="btn-secondary" onclick="saveReport()">↓ レポート保存 (.txt)</button>
+    <span class="status-bar" id="statusBar">ログファイルを選択して「解析実行」してください</span>
+  </div>
+  <div class="output-section" id="outputSection" style="display:none">
+    <div class="output-tabs" id="outputTabs"></div>
+    <div class="copy-bar">
+      <button onclick="copyReport()">クリップボードにコピー</button>
+      <span id="copyStatus"></span>
+    </div>
+    <pre id="outputPre"></pre>
+  </div>
+</div>
+
+<script>
+// =====================================================================
+//  STATE
+// =====================================================================
+const NUM_SERVERS = 6;
+const fileData    = {};   // key: "sv1_jstat" etc.
+const reportTexts = {};   // key: serverId | "comparison"
+let activeTab = '';
+
+// =====================================================================
+//  UI
+// =====================================================================
+(function initUI() {
+  const grid = document.getElementById('serversGrid');
+  for (let i = 1; i <= NUM_SERVERS; i++) {
+    const id = 'sv' + i;
+    const def = 'server0' + i;
+    grid.insertAdjacentHTML('beforeend', `
+      <div class="server-card" id="card_${id}">
+        <div class="server-name">
+          &#x25A0; <input type="text" id="name_${id}" value="${def}" maxlength="20">
+        </div>
+        <div class="file-row">
+          <label>jstat-gc</label>
+          <button class="file-btn" id="btn_${id}_jstat"  onclick="triggerFile('${id}','jstat')">選択</button>
+          <input  type="file" id="file_${id}_jstat"  accept=".log,.txt,.csv" onchange="loadFile('${id}','jstat',this)">
+          <span   class="file-status" id="stat_${id}_jstat">未選択</span>
+        </div>
+        <div class="file-row">
+          <label>jstack</label>
+          <button class="file-btn" id="btn_${id}_jstack" onclick="triggerFile('${id}','jstack')">選択</button>
+          <input  type="file" id="file_${id}_jstack" accept=".log,.txt"      onchange="loadFile('${id}','jstack',this)">
+          <span   class="file-status" id="stat_${id}_jstack">未選択</span>
+        </div>
+        <div class="file-row">
+          <label>access.log</label>
+          <button class="file-btn" id="btn_${id}_access" onclick="triggerFile('${id}','access')">選択</button>
+          <input  type="file" id="file_${id}_access" accept=".log,.txt"      onchange="loadFile('${id}','access',this)">
+          <span   class="file-status" id="stat_${id}_access">未選択</span>
+        </div>
+      </div>`);
+  }
+})();
+
+function triggerFile(svId, logType) {
+  document.getElementById('file_' + svId + '_' + logType).click();
+}
+
+function loadFile(svId, logType, input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    fileData[svId + '_' + logType] = e.target.result;
+    document.getElementById('btn_' + svId + '_' + logType).classList.add('loaded');
+    document.getElementById('btn_' + svId + '_' + logType).textContent = '読込済';
+    const st = document.getElementById('stat_' + svId + '_' + logType);
+    st.textContent = file.name;
+    st.className = 'file-status ok';
+    const hasAny = fileData[svId+'_jstat'] || fileData[svId+'_jstack'] || fileData[svId+'_access'];
+    document.getElementById('card_' + svId).classList.toggle('has-data', !!hasAny);
+  };
+  reader.readAsText(file, 'UTF-8');
+}
+
+// =====================================================================
+//  PARSER: jstat -gc  (with / without -t)
+//  Java 8 columns: S0C S1C S0U S1U EC EU OC OU MC MU CCSC CCSU YGC YGCT FGC FGCT GCT
+// =====================================================================
+function parseJstatGc(text) {
+  if (!text || !text.trim()) return [];
+  const lines = text.trim().split(/\r?\n/);
+  const records = [];
+  let hasTs = false;
+
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) continue;
+    // Header detection
+    if (t.startsWith('Timestamp') || t.startsWith('S0C')) {
+      hasTs = t.startsWith('Timestamp');
+      continue;
+    }
+    const p = t.split(/\s+/);
+    const off = hasTs ? 1 : 0;
+    // Safe field accessor
+    const f = (i) => (off + i < p.length ? parseFloat(p[off + i]) || 0 : 0);
+    if (p.length < off + 13) continue;  // need at least up to FGC
+
+    records.push({
+      lineNum   : records.length + 1,
+      timestamp : hasTs ? parseFloat(p[0]) : null,  // seconds since JVM start
+      s0c: f(0), s1c: f(1), s0u: f(2),  s1u: f(3),
+      ec : f(4), eu : f(5), oc : f(6),  ou : f(7),
+      mc : f(8), mu : f(9), ccsc:f(10), ccsu:f(11),
+      ygc: f(12), ygct:f(13), fgc:f(14), fgct:f(15), gct:f(16)
+    });
+  }
+  return records;
+}
+
+// =====================================================================
+//  PARSER: jstack  (複数ダンプ対応)
+// =====================================================================
+function parseJstack(text) {
+  if (!text || !text.trim()) return [];
+  const lines = text.split(/\r?\n/);
+  const dumps = [];
+  let cur = null, thr = null;
+
+  const pushThread = () => { if (thr && cur) { cur.threads.push(thr); thr = null; } };
+
+  for (const line of lines) {
+    // 新しいダンプの開始 (日時行)
+    if (/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/.test(line)) {
+      pushThread();
+      if (cur) dumps.push(cur);
+      cur = { timestamp: line.trim(), threads: [] };
+      continue;
+    }
+    if (line.includes('Full thread dump')) {
+      if (!cur) cur = { timestamp: null, threads: [] };
+      continue;
+    }
+    if (!cur) cur = { timestamp: null, threads: [] };
+
+    if (line.startsWith('"')) {
+      pushThread();
+      thr = { name: line, state: 'UNKNOWN', stackTrace: [], lockInfo: null };
+    } else if (thr) {
+      if (line.includes('java.lang.Thread.State:')) {
+        const m = line.match(/java\.lang\.Thread\.State:\s+(\w+)/);
+        if (m) thr.state = m[1];
+      } else if (line.trim().startsWith('at ')) {
+        thr.stackTrace.push(line.trim().substring(3));
+      } else if (line.includes('waiting to lock') || line.includes('waiting on')) {
+        thr.lockInfo = line.trim();
+      }
+    }
+  }
+  pushThread();
+  if (cur && cur.threads.length > 0) dumps.push(cur);
+  return dumps;
+}
+
+// =====================================================================
+//  PARSER: Tomcat アクセスログ (Combined + optional %D/%T)
+// =====================================================================
+function parseAccessLog(text) {
+  if (!text || !text.trim()) return [];
+  const MONTHS = {Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11};
+  // ip - user [DD/Mon/YYYY:HH:MM:SS tz] "METHOD URI PROTO" STATUS BYTES [rest]
+  const PAT = /\S+\s+\S+\s+\S+\s+\[(\d{2})\/(\w{3})\/(\d{4}):(\d{2}):(\d{2}):(\d{2})[^\]]*\]\s+"(\S+)\s+(\S+)[^"]*"\s+(\d+)\s+(\S+)(.*)/;
+  const entries = [];
+
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const m = line.match(PAT);
+    if (!m) continue;
+    const [, dd, mon, yyyy, hh, mm, ss, method, rawUri, status, , rest] = m;
+    const ts = new Date(+yyyy, MONTHS[mon]||0, +dd, +hh, +mm, +ss);
+    // レスポンスタイム: 行末の数値を取得
+    let rtMs = null;
+    const nums = rest.trim().match(/(\d+)\s*$/);
+    if (nums) {
+      const n = parseInt(nums[1]);
+      rtMs = n > 100000 ? Math.round(n / 1000) : n;  // μs → ms
+    }
+    entries.push({
+      timestamp  : ts,
+      method,
+      uri        : rawUri.split('?')[0],
+      status     : parseInt(status),
+      responseTimeMs: rtMs
+    });
+  }
+  return entries;
+}
+
+// =====================================================================
+//  ANALYZER: jstat
+// =====================================================================
+function analyzeJstat(records) {
+  if (!records || records.length < 2) return null;
+  const fgcEvents = [];
+  let maxOld = 0, sumOld = 0;
+
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    const pct = r.oc > 0 ? (r.ou / r.oc) * 100 : 0;
+    sumOld += pct;
+    if (pct > maxOld) maxOld = pct;
+
+    if (i > 0 && r.fgc > records[i-1].fgc) {
+      const prev = records[i-1];
+      fgcEvents.push({
+        lineNum     : i + 1,
+        timestamp   : r.timestamp,
+        fgcNum      : r.fgc,
+        duration    : r.fgct - prev.fgct,
+        oldBefore   : prev.oc > 0 ? (prev.ou / prev.oc) * 100 : 0,
+        oldAfter    : r.oc   > 0 ? (r.ou   / r.oc)   * 100 : 0,
+      });
+    }
+  }
+
+  const first = records[0], last = records[records.length - 1];
+  const totalFgcTime = last.fgct - first.fgct;
+  const fgcInPeriod  = last.fgc  - first.fgc;
+  const maxDur = fgcEvents.reduce((m,e) => Math.max(m, e.duration), 0);
+  const avgDur = fgcEvents.length ? totalFgcTime / fgcEvents.length : 0;
+  const hasTs  = first.timestamp !== null;
+  let gcOverhead = null;
+  if (hasTs && last.timestamp - first.timestamp > 0)
+    gcOverhead = ((last.gct - first.gct) / (last.timestamp - first.timestamp)) * 100;
+
+  return {
+    fgcEvents, fgcInPeriod, totalFgcTime,
+    avgFgcDuration : avgDur,
+    maxFgcDuration : maxDur,
+    maxOldGenPct   : maxOld,
+    avgOldGenPct   : sumOld / records.length,
+    gcOverhead, hasTimestamp: hasTs,
+    totalYgc  : last.ygc  - first.ygc,
+    totalYgct : last.ygct - first.ygct,
+    ocKb      : last.oc,
+    records
+  };
+}
+
+// =====================================================================
+//  ANALYZER: jstack
+// =====================================================================
+function analyzeJstack(dumps) {
+  if (!dumps || dumps.length === 0) return null;
+  const dumpStats = [];
+  const frameCount = {};
+
+  for (const dump of dumps) {
+    const sc = {RUNNABLE:0, BLOCKED:0, WAITING:0, TIMED_WAITING:0};
+    const blocked = [];
+    for (const t of dump.threads) {
+      sc[t.state] = (sc[t.state] || 0) + 1;
+      if (t.state === 'BLOCKED') blocked.push(t);
+      if (t.stackTrace.length > 0) {
+        const f = t.stackTrace[0];
+        frameCount[f] = (frameCount[f] || 0) + 1;
+      }
+    }
+    dumpStats.push({ timestamp: dump.timestamp, total: dump.threads.length, sc, blocked });
+  }
+
+  const avg = {RUNNABLE:0, BLOCKED:0, WAITING:0, TIMED_WAITING:0};
+  for (const ds of dumpStats)
+    for (const k of Object.keys(avg)) avg[k] += ds.sc[k] || 0;
+  for (const k of Object.keys(avg)) avg[k] = Math.round(avg[k] / dumpStats.length);
+
+  const topFrames = Object.entries(frameCount)
+    .sort((a,b)=>b[1]-a[1]).slice(0,5)
+    .map(([frame, count]) => ({frame, count}));
+
+  return {
+    dumpStats, avgStats: avg,
+    maxBlocked : dumpStats.reduce((m,ds) => Math.max(m, ds.sc.BLOCKED||0), 0),
+    topFrames,
+    totalDumps : dumps.length
+  };
+}
+
+// =====================================================================
+//  ANALYZER: アクセスログ
+// =====================================================================
+function analyzeAccessLog(entries) {
+  if (!entries || entries.length === 0) return null;
+  const uriCount = {}, uriTimes = {};
+  const sc = {'2xx':0,'3xx':0,'4xx':0,'5xx':0};
+  let slowCount = 0;
+  // 時間帯別リクエスト数 (分単位)
+  const minBucket = {};
+
+  for (const e of entries) {
+    uriCount[e.uri] = (uriCount[e.uri] || 0) + 1;
+    if (!uriTimes[e.uri]) uriTimes[e.uri] = [];
+    if (e.responseTimeMs !== null) {
+      uriTimes[e.uri].push(e.responseTimeMs);
+      if (e.responseTimeMs > 3000) slowCount++;
+    }
+    const k = Math.floor(e.status / 100) + 'xx';
+    sc[k] = (sc[k] || 0) + 1;
+
+    if (e.timestamp && !isNaN(e.timestamp.getTime())) {
+      const bk = fmtDate(e.timestamp);
+      minBucket[bk] = (minBucket[bk] || 0) + 1;
+    }
+  }
+
+  const topUris = Object.entries(uriCount)
+    .sort((a,b)=>b[1]-a[1]).slice(0,10)
+    .map(([uri, count]) => {
+      const ts  = uriTimes[uri] || [];
+      const srt = [...ts].sort((a,b)=>a-b);
+      return {
+        uri, count,
+        avg : ts.length ? Math.round(ts.reduce((s,v)=>s+v,0)/ts.length) : null,
+        p95 : srt.length ? srt[Math.floor(srt.length*0.95)] : null,
+        max : srt.length ? srt[srt.length-1] : null,
+      };
+    });
+
+  // リクエストが多い時間帯 Top5
+  const topMinutes = Object.entries(minBucket)
+    .sort((a,b)=>b[1]-a[1]).slice(0,5)
+    .map(([ts, count]) => ({ts, count}));
+
+  return { totalRequests: entries.length, slowCount, statusCounts: sc, topUris, topMinutes, uriCount, uriTimes };
+}
+
+function fmtDate(d) {
+  return d.getFullYear() + '-' + p2(d.getMonth()+1) + '-' + p2(d.getDate())
+       + ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes());
+}
+function p2(n) { return String(n).padStart(2,'0'); }
+
+// =====================================================================
+//  REPORT: サーバー個別
+// =====================================================================
+const SEP  = '='.repeat(80);
+const SEP2 = '-'.repeat(80);
+
+function buildServerReport(serverId, jstat, jstack, access) {
+  const L = [];
+  const add = (s) => L.push(s === undefined ? '' : s);
+
+  add(SEP);
+  add('  GC Analysis Report - ' + serverId);
+  add('  Generated: ' + new Date().toLocaleString('ja-JP'));
+  add(SEP);
+  add();
+
+  /* -------- [1] Full GC -------- */
+  add('[1] FULL GC サマリ');
+  add(SEP2);
+  if (jstat) {
+    add('  Total FullGC 回数    : ' + jstat.fgcInPeriod + ' 回');
+    add('  Total FullGC 時間    : ' + jstat.totalFgcTime.toFixed(3) + ' 秒');
+    add('  平均 FullGC 時間     : ' + jstat.avgFgcDuration.toFixed(3) + ' 秒/回');
+    add('  最大 FullGC 時間     : ' + jstat.maxFgcDuration.toFixed(3) + ' 秒');
+    if (jstat.gcOverhead !== null) {
+      const w = jstat.gcOverhead > 10 ? '  ← WARNING: 10% 超!' : '';
+      add('  GC オーバーヘッド   : ' + jstat.gcOverhead.toFixed(2) + '%' + w);
+    } else {
+      add('  GC オーバーヘッド   : N/A  ※ jstat -t オプション推奨');
+    }
+    add();
+    add('  FullGC イベント一覧:');
+    add('  ' + '-'.repeat(74));
+    add('  #  | 行/経過時刻          | FGC累計 | 所要(s) | OldGen前    | OldGen後');
+    add('  ' + '-'.repeat(74));
+    if (jstat.fgcEvents.length === 0) {
+      add('  (FullGC イベント検出なし)');
+    } else {
+      jstat.fgcEvents.forEach((ev, i) => {
+        const ts   = ev.timestamp !== null ? ('t=' + ev.timestamp.toFixed(1) + 's') : ('行 ' + ev.lineNum);
+        const mark = ev.oldBefore > 90 ? '(**)' : '    ';
+        add('  ' + String(i+1).padStart(2)
+          + ' | ' + ts.padEnd(20)
+          + ' | ' + String(ev.fgcNum).padStart(7)
+          + ' | ' + ev.duration.toFixed(3).padStart(7)
+          + ' | ' + ev.oldBefore.toFixed(1).padStart(6) + '% ' + mark
+          + ' | ' + ev.oldAfter.toFixed(1).padStart(6) + '%');
+      });
+      add('  (**) = GC 直前の OldGen 使用率が 90% 超');
+    }
+    add();
+  } else {
+    add('  N/A (jstat_gc.log 未読込)');
+    add();
+  }
+
+  /* -------- [2] Old Gen 推移 -------- */
+  add('[2] OLD GEN 使用率推移');
+  add(SEP2);
+  if (jstat) {
+    add('  最大使用率  : ' + jstat.maxOldGenPct.toFixed(1) + '%'
+      + (jstat.maxOldGenPct > 85 ? '  ← 高負荷' : ''));
+    add('  平均使用率  : ' + jstat.avgOldGenPct.toFixed(1) + '%');
+    add('  OldGen 容量 : ' + jstat.ocKb.toFixed(0) + ' KB  (' + (jstat.ocKb/1024).toFixed(1) + ' MB)');
+    add();
+    add('  使用率サンプリング:');
+    const recs = jstat.records;
+    const step = Math.max(1, Math.floor(recs.length / 14));
+    for (let i = 0; i < recs.length; i += step) {
+      const r   = recs[i];
+      const pct = r.oc > 0 ? (r.ou / r.oc) * 100 : 0;
+      const bar = '█'.repeat(Math.round(pct/5)).padEnd(20,'░');
+      const lbl = r.timestamp !== null ? ('t=' + r.timestamp.toFixed(0) + 's') : ('行' + String(i+1).padStart(5));
+      add('  ' + lbl.padEnd(13) + '[' + bar + '] ' + pct.toFixed(1) + '%'
+        + (pct > 85 ? '  ← 警告' : ''));
+    }
+    add();
+  } else {
+    add('  N/A'); add();
+  }
+
+  /* -------- [3] Young GC -------- */
+  add('[3] YOUNG GC サマリ');
+  add(SEP2);
+  if (jstat) {
+    add('  YGC 回数   : ' + jstat.totalYgc + ' 回');
+    add('  YGC 時間   : ' + jstat.totalYgct.toFixed(3) + ' 秒');
+    const avg = jstat.totalYgc > 0 ? (jstat.totalYgct / jstat.totalYgc * 1000) : 0;
+    add('  平均 YGC   : ' + avg.toFixed(1) + ' ms/回');
+    add();
+  } else {
+    add('  N/A'); add();
+  }
+
+  /* -------- [4] スレッドダンプ -------- */
+  add('[4] スレッドダンプ解析');
+  add(SEP2);
+  if (jstack) {
+    add('  解析ダンプ数 : ' + jstack.totalDumps + ' 件');
+    add();
+    add('  スレッド状態分布 (全ダンプ平均):');
+    add('    RUNNABLE      : ' + jstack.avgStats.RUNNABLE + ' スレッド');
+    add('    WAITING       : ' + jstack.avgStats.WAITING + ' スレッド');
+    add('    TIMED_WAITING : ' + jstack.avgStats.TIMED_WAITING + ' スレッド');
+    add('    BLOCKED       : ' + jstack.avgStats.BLOCKED + ' スレッド');
+    add();
+    add('  BLOCKED 最大  : ' + jstack.maxBlocked + ' スレッド'
+      + (jstack.maxBlocked > 5 ? '  ← WARNING: ロック競合の可能性' : ''));
+    add();
+
+    const spikes = jstack.dumpStats.filter(ds => (ds.sc.BLOCKED||0) > 3);
+    if (spikes.length > 0) {
+      add('  BLOCKED スパイク検出:');
+      for (const ds of spikes) {
+        add('  ' + (ds.timestamp || '(時刻不明)') + '  →  BLOCKED: ' + ds.sc.BLOCKED + ' スレッド');
+        for (const bt of ds.blocked.slice(0, 3)) {
+          add('    ' + bt.name.substring(0, 64));
+          if (bt.lockInfo) add('      ' + bt.lockInfo.substring(0, 70));
+        }
+      }
+      add();
+    }
+
+    add('  頻出スタックフレーム Top5:');
+    jstack.topFrames.forEach((f, i) =>
+      add('  ' + (i+1) + '. ' + String(f.count).padStart(4) + ' スレッド : ' + f.frame.substring(0, 62)));
+    add();
+  } else {
+    add('  N/A (jstack.log 未読込)'); add();
+  }
+
+  /* -------- [5] アクセスログ -------- */
+  add('[5] アクセスログ解析');
+  add(SEP2);
+  if (access) {
+    const slowPct = ((access.slowCount / access.totalRequests) * 100).toFixed(2);
+    add('  総リクエスト数 : ' + access.totalRequests.toLocaleString() + ' 件');
+    add('  遅延 (>3s)     : ' + access.slowCount.toLocaleString() + ' 件  (' + slowPct + '%)');
+    add();
+    add('  ステータスコード分布:');
+    for (const [k,v] of Object.entries(access.statusCounts))
+      if (v > 0) add('    ' + k + ': ' + v.toLocaleString() + ' 件');
+    add();
+
+    if (access.topMinutes.length > 0) {
+      add('  リクエスト集中時間帯 Top5 (分単位):');
+      for (const b of access.topMinutes)
+        add('  ' + b.ts + '  :  ' + b.count + ' req/min');
+      add();
+    }
+
+    add('  URI 別 Top10 (全体):');
+    add('  ' + '-'.repeat(72));
+    add('  順位 |  件数   | 平均(ms) | P95(ms) | 最大(ms) | URI');
+    add('  ' + '-'.repeat(72));
+    access.topUris.forEach((u, i) => {
+      const avg = u.avg !== null ? String(u.avg).padStart(8)  : '       -';
+      const p95 = u.p95 !== null ? String(u.p95).padStart(7)  : '      -';
+      const max = u.max !== null ? String(u.max).padStart(8)  : '       -';
+      const slow= u.avg !== null && u.avg > 3000 ? '  ★遅延' : '';
+      add('  ' + String(i+1).padStart(4)
+        + ' | ' + String(u.count).padStart(7)
+        + ' | ' + avg
+        + ' | ' + p95
+        + ' | ' + max
+        + ' | ' + u.uri.substring(0,36) + slow);
+    });
+    add();
+  } else {
+    add('  N/A (access.log 未読込)'); add();
+  }
+
+  /* -------- [6] 推奨事項 -------- */
+  add('[6] 推奨事項 / 注意点');
+  add(SEP2);
+  const recs = [];
+  if (!jstat)  recs.push('- jstat_gc.log を読み込むと GC 詳細が分析できます');
+  if (!jstack) recs.push('- jstack.log を読み込むとスレッド状態が分析できます');
+  if (!access) recs.push('- access.log を読み込むと URI 別影響が分析できます');
+  if (jstat && !jstat.hasTimestamp)
+    recs.push('- [INFO] jstat に -t を付けて再取得すると時系列相関が可能:  jstat -gc -t <pid> <interval>ms');
+  if (jstat && jstat.maxOldGenPct > 85)
+    recs.push('- [HIGH] OldGen 最大 ' + jstat.maxOldGenPct.toFixed(1)
+      + '% → ヒープ増設 (-Xmx) またはオブジェクト保持の見直し');
+  if (jstat && jstat.gcOverhead !== null && jstat.gcOverhead > 10)
+    recs.push('- [HIGH] GC オーバーヘッド ' + jstat.gcOverhead.toFixed(1) + '% (10%超) → 深刻な GC 負荷');
+  if (jstack && jstack.maxBlocked > 5)
+    recs.push('- [MEDIUM] BLOCKED スレッド最大 ' + jstack.maxBlocked + ' → DB 接続プール・ロック競合を調査');
+  if (access) {
+    for (const u of access.topUris.filter(u => u.avg !== null && u.avg > 3000))
+      recs.push('- [HIGH] ' + u.uri + ' (avg ' + u.avg + 'ms) → 大量オブジェクト生成・N+1 クエリを確認');
+  }
+  if (recs.length === 0) recs.push('  特記事項なし');
+  for (const r of recs) add('  ' + r);
+  add();
+
+  add(SEP);
+  add('  END OF REPORT: ' + serverId);
+  add(SEP);
+  return L.join('\n');
+}
+
+// =====================================================================
+//  REPORT: 比較サマリ
+// =====================================================================
+function buildComparisonReport(allResults) {
+  const L = [];
+  const add = (s) => L.push(s === undefined ? '' : s);
+  const ids = Object.keys(allResults);
+  const CW  = 12;  // column width
+
+  add(SEP);
+  add('  FullGC 比較サマリ - 全サーバー');
+  add('  Generated: ' + new Date().toLocaleString('ja-JP'));
+  add(SEP);
+  add();
+
+  /* ---- OVERVIEW TABLE ---- */
+  add('[OVERVIEW TABLE]');
+  add(SEP2);
+  const hdr = 'メトリクス                      ' + ids.map(id => id.padEnd(CW)).join('');
+  add(hdr);
+  add('-'.repeat(hdr.length));
+
+  const ROWS = [
+    ['FullGC 回数',        id => allResults[id].jstat  ? String(allResults[id].jstat.fgcInPeriod)                     : 'N/A'],
+    ['FullGC 合計時間(s)', id => allResults[id].jstat  ? allResults[id].jstat.totalFgcTime.toFixed(2)                 : 'N/A'],
+    ['平均 FGC 時間(s)',   id => allResults[id].jstat  ? allResults[id].jstat.avgFgcDuration.toFixed(2)               : 'N/A'],
+    ['OldGen 最大(%)',     id => allResults[id].jstat  ? allResults[id].jstat.maxOldGenPct.toFixed(1)                 : 'N/A'],
+    ['OldGen 平均(%)',     id => allResults[id].jstat  ? allResults[id].jstat.avgOldGenPct.toFixed(1)                 : 'N/A'],
+    ['GC オーバーヘッド(%)' ,id=>allResults[id].jstat && allResults[id].jstat.gcOverhead !== null
+                                                        ? allResults[id].jstat.gcOverhead.toFixed(1)                  : 'N/A'],
+    ['BLOCKED 最大数',     id => allResults[id].jstack ? String(allResults[id].jstack.maxBlocked)                     : 'N/A'],
+    ['総リクエスト数',      id => allResults[id].access ? allResults[id].access.totalRequests.toLocaleString()         : 'N/A'],
+    ['遅延リクエスト(>3s)', id => allResults[id].access ? allResults[id].access.slowCount.toLocaleString()            : 'N/A'],
+  ];
+
+  for (const [label, getter] of ROWS)
+    add(label.padEnd(32) + ids.map(id => getter(id).padEnd(CW)).join(''));
+  add();
+
+  /* ---- 外れ値 ---- */
+  add('[外れ値検出]');
+  add(SEP2);
+  const fgcList = ids.filter(id => allResults[id].jstat)
+                     .map(id => ({id, v: allResults[id].jstat.fgcInPeriod}));
+  if (fgcList.length > 1) {
+    const avg = fgcList.reduce((s,x)=>s+x.v,0) / fgcList.length;
+    const high = fgcList.filter(x=>x.v > avg*1.3).map(x=>x.id);
+    const low  = fgcList.filter(x=>x.v < avg*0.5).map(x=>x.id);
+    add('  全体平均 FullGC 回数 : ' + avg.toFixed(1) + ' 回');
+    if (high.length) add('  高負荷サーバー       : ' + high.join(', ') + '  (平均の 1.3 倍超)');
+    if (low.length)  add('  低負荷サーバー       : ' + low.join(', ')  + '  (平均の 0.5 倍未満) → バッチ割当差異の可能性');
+    if (!high.length && !low.length) add('  外れ値なし (均等分散)');
+  } else {
+    add('  (比較対象データ不足)');
+  }
+  add();
+
+  /* ---- 遅延 URI 比較 ---- */
+  add('[遅延 URI 比較 (avg > 3s)]');
+  add(SEP2);
+  const allSlowUris = new Set();
+  for (const id of ids) {
+    const a = allResults[id].access;
+    if (a) a.topUris.filter(u => u.avg !== null && u.avg > 3000).forEach(u => allSlowUris.add(u.uri));
+  }
+  if (allSlowUris.size > 0) {
+    const uh = 'URI'.padEnd(42) + ids.map(id=>id.padEnd(CW)).join('');
+    add(uh);
+    add('-'.repeat(uh.length));
+    for (const uri of allSlowUris) {
+      const row = uri.substring(0,41).padEnd(42) + ids.map(id => {
+        const a = allResults[id].access;
+        if (!a) return 'N/A'.padEnd(CW);
+        const u = a.topUris.find(x=>x.uri===uri);
+        return u ? (u.count + '(' + (u.avg||'-') + 'ms)').padEnd(CW) : '-'.padEnd(CW);
+      }).join('');
+      add(row);
+    }
+  } else {
+    add('  遅延 URI なし (またはアクセスログ未読込)');
+  }
+  add();
+
+  /* ---- 推奨事項 ---- */
+  add('[推奨事項]');
+  add(SEP2);
+  let n = 1;
+  const highOld = ids.filter(id => allResults[id].jstat && allResults[id].jstat.maxOldGenPct > 85);
+  if (highOld.length) {
+    add('  ' + (n++) + '. [HIGH] OldGen 85% 超 : ' + highOld.join(', '));
+    add('     → ヒープ増設 (-Xmx) またはオブジェクト保持の見直し');
+  }
+  if (allSlowUris.size > 0) {
+    add('  ' + (n++) + '. [HIGH] 遅延 URI が FullGC トリガーの可能性:');
+    for (const uri of allSlowUris) add('     - ' + uri);
+    add('     → 大量オブジェクト生成・N+1 クエリ・ページネーション漏れを確認');
+  }
+  const highBlk = ids.filter(id => allResults[id].jstack && allResults[id].jstack.maxBlocked > 5);
+  if (highBlk.length) {
+    add('  ' + (n++) + '. [MEDIUM] BLOCKED スレッド多発 : ' + highBlk.join(', '));
+    add('     → DB 接続プールサイズ・ロック競合を調査');
+  }
+  const noTs = ids.filter(id => allResults[id].jstat && !allResults[id].jstat.hasTimestamp);
+  if (noTs.length) {
+    add('  ' + (n++) + '. [INFO] jstat -t 未使用 : ' + noTs.join(', '));
+    add('     → jstat -gc -t <pid> <interval>ms で再取得すると時系列相関が可能');
+  }
+  if (n === 1) add('  特記事項なし');
+  add();
+
+  add(SEP);
+  add('  END OF COMPARISON SUMMARY');
+  add(SEP);
+  return L.join('\n');
+}
+
+// =====================================================================
+//  MAIN: 解析実行
+// =====================================================================
+function analyzeAll() {
+  const allResults = {};
+  let anyData = false;
+
+  for (let i = 1; i <= NUM_SERVERS; i++) {
+    const svId     = 'sv' + i;
+    const serverId = (document.getElementById('name_' + svId).value || ('server0' + i)).trim();
+    const jstatTxt = fileData[svId + '_jstat'];
+    const jstackTxt= fileData[svId + '_jstack'];
+    const accessTxt= fileData[svId + '_access'];
+    if (!jstatTxt && !jstackTxt && !accessTxt) continue;
+    anyData = true;
+
+    try {
+      const jstatR  = jstatTxt  ? analyzeJstat(parseJstatGc(jstatTxt))          : null;
+      const jstackR = jstackTxt ? analyzeJstack(parseJstack(jstackTxt))         : null;
+      const accessR = accessTxt ? analyzeAccessLog(parseAccessLog(accessTxt))   : null;
+      allResults[serverId] = { jstat: jstatR, jstack: jstackR, access: accessR };
+      reportTexts[serverId] = buildServerReport(serverId, jstatR, jstackR, accessR);
+    } catch(e) {
+      reportTexts[serverId + '(エラー)'] = '解析中にエラーが発生しました: ' + e.message;
+      allResults[serverId] = { jstat: null, jstack: null, access: null };
+    }
+  }
+
+  if (!anyData) { setStatus('ログファイルを 1 つ以上読み込んでください', 'error'); return; }
+
+  reportTexts['comparison'] = buildComparisonReport(allResults);
+  renderTabs(Object.keys(allResults));
+  setStatus('解析完了:  ' + Object.keys(allResults).length + ' サーバー', 'ok');
+}
+
+// =====================================================================
+//  TAB / OUTPUT
+// =====================================================================
+function renderTabs(serverIds) {
+  const tabsEl = document.getElementById('outputTabs');
+  tabsEl.innerHTML = '';
+  document.getElementById('outputSection').style.display = 'block';
+  const allTabs = [...serverIds, 'comparison'];
+  for (const id of allTabs) {
+    const label = id === 'comparison' ? '📊 比較サマリ' : id;
+    const tab = document.createElement('div');
+    tab.className = 'output-tab';
+    tab.textContent = label;
+    tab.id = 'tab_' + id;
+    tab.onclick = () => switchTab(id);
+    tabsEl.appendChild(tab);
+  }
+  switchTab(serverIds[0] || 'comparison');
+}
+
+function switchTab(id) {
+  if (activeTab) {
+    const prev = document.getElementById('tab_' + activeTab);
+    if (prev) prev.classList.remove('active');
+  }
+  activeTab = id;
+  const tab = document.getElementById('tab_' + id);
+  if (tab) tab.classList.add('active');
+  document.getElementById('outputPre').textContent = reportTexts[id] || '(データなし)';
+}
+
+function copyReport() {
+  const text = document.getElementById('outputPre').textContent;
+  navigator.clipboard.writeText(text).then(() => {
+    const s = document.getElementById('copyStatus');
+    s.textContent = 'コピーしました';
+    setTimeout(() => { s.textContent = ''; }, 2000);
+  });
+}
+
+function saveReport() {
+  const all = Object.entries(reportTexts).map(([,v])=>v).join('\n\n');
+  if (!all.trim()) { setStatus('先に解析を実行してください', 'error'); return; }
+  const dt  = new Date().toISOString().slice(0,10);
+  const blob = new Blob([all], {type:'text/plain;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'gc_analysis_' + dt + '.txt';
+  a.click();
+  URL.revokeObjectURL(a.href);
+  setStatus('保存しました: gc_analysis_' + dt + '.txt', 'ok');
+}
+
+function setStatus(msg, type) {
+  const el = document.getElementById('statusBar');
+  el.textContent = msg;
+  el.className = 'status-bar ' + (type || '');
+}
+</script>
+</body>
+</html>
