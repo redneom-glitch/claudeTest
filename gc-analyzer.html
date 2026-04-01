@@ -43,7 +43,7 @@ pre#outputPre{background:#1e1e2e;padding:14px 16px;font-size:12px;line-height:1.
 </style>
 </head>
 <body>
-<h1>FullGC 解析ツール <span>v2.1 &nbsp;|&nbsp; jstat-gc / jstack / Tomcat アクセスログ対応</span></h1>
+<h1>FullGC 解析ツール <span>v2.2 &nbsp;|&nbsp; jstat-gc / JVMスレッドダンプ / Tomcat アクセスログ対応</span></h1>
 <div class="container">
   <div class="servers-grid" id="serversGrid"></div>
   <div class="actions">
@@ -90,7 +90,7 @@ let activeTab = '';
           <span   class="file-status" id="stat_${id}_jstat">未選択</span>
         </div>
         <div class="file-row">
-          <label>jstack</label>
+          <label>スレッドダンプ</label>
           <button class="file-btn" id="btn_${id}_jstack" onclick="triggerFile('${id}','jstack')">選択</button>
           <input  type="file" id="file_${id}_jstack" accept=".log,.txt"      onchange="loadFile('${id}','jstack',this)">
           <span   class="file-status" id="stat_${id}_jstack">未選択</span>
@@ -714,7 +714,7 @@ function buildServerReport(serverId, jstat, jstack, access) {
     add('  └');
     add();
   } else {
-    add('  N/A (jstack.log 未読込)'); add();
+    add('  N/A (スレッドダンプ未読込)'); add();
   }
 
   /* -------- [5] アクセスログ -------- */
