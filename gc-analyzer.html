@@ -43,7 +43,7 @@ pre#outputPre{background:#1e1e2e;padding:14px 16px;font-size:12px;line-height:1.
 </style>
 </head>
 <body>
-<h1>FullGC 解析ツール <span>v2.2 &nbsp;|&nbsp; jstat-gc / JVMスレッドダンプ / Tomcat アクセスログ対応</span></h1>
+<h1>FullGC 解析ツール <span>v2.3 &nbsp;|&nbsp; jstat-gc / JVMスレッドダンプ(jcmd対応) / Tomcat アクセスログ対応</span></h1>
 <div class="container">
   <div class="servers-grid" id="serversGrid"></div>
   <div class="actions">
@@ -163,7 +163,7 @@ function parseJstatGc(text) {
 }
 
 // =====================================================================
-//  PARSER: jstack  (複数ダンプ対応)
+//  PARSER: スレッドダンプ (jstack / jcmd Thread.print 両対応)
 // =====================================================================
 function parseJstack(text) {
   if (!text || !text.trim()) return [];
@@ -171,10 +171,18 @@ function parseJstack(text) {
   const dumps = [];
   let cur = null, thr = null;
   let deadlockLines = [], inDeadlock = false;
+  // jcmd Thread.print 末尾の JNI/Heap セクションをスキップするフラグ
+  let inIgnoredSection = false;
 
   const pushThread = () => { if (thr && cur) { cur.threads.push(thr); thr = null; } };
 
   for (const line of lines) {
+    // JNI global references / Heap セクション (jcmd 特有) は無視
+    if (/^JNI global ref|^Heap$|^def new generation|^tenured generation|^Metaspace/i.test(line)) {
+      inIgnoredSection = true;
+    }
+    if (inIgnoredSection) continue;
+
     // デッドロックセクション検出
     if (/Found (one |a )?Java-level deadlock/i.test(line)) {
       inDeadlock = true; deadlockLines = [line]; continue;
@@ -190,6 +198,7 @@ function parseJstack(text) {
       if (cur) { cur.deadlockLines = deadlockLines; dumps.push(cur); }
       cur = { timestamp: line.trim(), threads: [], deadlockLines: [] };
       deadlockLines = [];
+      inIgnoredSection = false;
       continue;
     }
     if (line.includes('Full thread dump')) {
@@ -198,18 +207,28 @@ function parseJstack(text) {
     }
     if (!cur) cur = { timestamp: null, threads: [], deadlockLines: [] };
 
+    // スレッドヘッダ: "スレッド名" #N ... (jstack / jcmd 共通)
+    // jcmd では cpu=Xms elapsed=Xs が tid= の前に追加される
     if (line.startsWith('"')) {
       pushThread();
       const nm = line.match(/^"([^"]+)"/);
+      // jcmd Thread.print: cpu=1.23ms または cpu=456us
+      const cpuM = line.match(/\bcpu=(\d+(?:\.\d+)?)(ms|us)\b/);
+      // jcmd Thread.print: elapsed=3600.00s
+      const elM  = line.match(/\belapsed=(\d+(?:\.\d+)?)s\b/);
       thr = {
-        name      : line,
-        threadName: nm ? nm[1] : line,
-        state     : 'UNKNOWN',
-        stackTrace: [],
-        lockInfo  : null,
-        heldLocks : [],    // - locked <0x...>
-        waitingLock: null, // - waiting to lock <0x...>
-        waitingOn  : null, // - waiting on <0x...>
+        name       : line,
+        threadName : nm ? nm[1] : line,
+        state      : 'UNKNOWN',
+        stackTrace : [],
+        lockInfo   : null,
+        heldLocks  : [],    // - locked <0x...>
+        waitingLock: null,  // - waiting to lock <0x...>  (BLOCKED)
+        waitingOn  : null,  // - waiting on <0x...>       (Object.wait)
+        parkingFor : null,  // - parking to wait for <0x...> (Condition.await / LockSupport.park)
+        // jcmd 付加情報
+        cpuMs      : cpuM ? parseFloat(cpuM[1]) * (cpuM[2] === 'us' ? 0.001 : 1) : null,
+        elapsedSec : elM  ? parseFloat(elM[1]) : null,
       };
     } else if (thr) {
       if (line.includes('java.lang.Thread.State:')) {
@@ -227,6 +246,11 @@ function parseJstack(text) {
       } else if (line.includes('- waiting on <')) {
         const m = line.match(/- waiting on <(0x[0-9a-f]+)>/i);
         if (m) thr.waitingOn = m[1];
+        thr.lockInfo = line.trim();
+      } else if (line.includes('- parking to wait for')) {
+        // jcmd / jstack 共通: java.util.concurrent.locks.Condition 待機
+        const m = line.match(/- parking to wait for\s+<(0x[0-9a-f]+)>/i);
+        if (m) thr.parkingFor = m[1];
         thr.lockInfo = line.trim();
       }
     }
@@ -325,7 +349,7 @@ function analyzeJstat(records) {
 }
 
 // =====================================================================
-//  ANALYZER: jstack
+//  ANALYZER: スレッドダンプ (jstack / jcmd Thread.print)
 // =====================================================================
 function analyzeJstack(dumps) {
   if (!dumps || dumps.length === 0) return null;
@@ -369,6 +393,16 @@ function analyzeJstack(dumps) {
         if (!lockMap[t.waitingLock]) lockMap[t.waitingLock] = { holder: null, waiters: [] };
         lockMap[t.waitingLock].waiters.push(t.threadName);
       }
+      // jcmd / jstack: Condition.await / LockSupport.park による待機もロック競合マップに追加
+      // ただしスレッドプールのアイドル待機 (LinkedBlockingQueue 等) は除外
+      if (t.parkingFor) {
+        const stack = t.stackTrace.join('\n');
+        const isIdleWait = /LinkedBlockingQueue|DelayQueue|SynchronousQueue|ThreadPoolExecutor\.getTask/i.test(stack);
+        if (!isIdleWait) {
+          if (!lockMap[t.parkingFor]) lockMap[t.parkingFor] = { holder: null, waiters: [] };
+          lockMap[t.parkingFor].waiters.push(t.threadName);
+        }
+      }
 
       // 待機理由分類
       if (t.state !== 'RUNNABLE') {
@@ -377,7 +411,7 @@ function analyzeJstack(dumps) {
           waitReasons.db++;
         else if (/SocketInputStream|SocketChannel|PlainSocket|AbstractChannel/i.test(stack))
           waitReasons.network++;
-        else if (t.waitingLock)
+        else if (t.waitingLock || t.parkingFor)
           waitReasons.lock++;
         else if (/Thread\.sleep|LockSupport\.park|Object\.wait/i.test(stack))
           waitReasons.sleep++;
@@ -385,14 +419,20 @@ function analyzeJstack(dumps) {
           waitReasons.other++;
       }
 
-      // CPU 負荷スレッド候補 (RUNNABLE + アプリ固有コード)
-      if (t.state === 'RUNNABLE') {
+      // CPU 負荷スレッド候補
+      // jcmd の cpu= フィールドがある場合はそちらを優先 (cpuMs > 100ms を閾値)
+      // ない場合は RUNNABLE + アプリ固有フレームで推定
+      const hasCpuInfo = t.cpuMs !== null;
+      if (hasCpuInfo ? (t.cpuMs > 100) : (t.state === 'RUNNABLE')) {
         const appFrame = t.stackTrace.find(f =>
           !f.startsWith('java.') && !f.startsWith('sun.') &&
           !f.startsWith('com.sun.') && !f.startsWith('jdk.') &&
           !f.startsWith('org.apache.') && !f.startsWith('org.springframework.')
         );
-        if (appFrame) cpuCandidates.push({ name: t.threadName, frame: appFrame });
+        if (appFrame) {
+          const cpuLabel = t.cpuMs !== null ? ` [cpu=${t.cpuMs.toFixed(1)}ms]` : '';
+          cpuCandidates.push({ name: t.threadName + cpuLabel, frame: appFrame });
+        }
       }
     }
 
